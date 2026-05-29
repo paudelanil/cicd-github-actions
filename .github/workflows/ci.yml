@@ -1,14 +1,20 @@
-name: CI
+name: CI & Build
 
-# Lints, format-checks, and tests the code on every push to main and every
-# PR. Each Python version in the matrix runs in parallel on its own VM.
+# Lints/format-checks/tests the code, then builds and pushes the Docker image
+# to GitHub Container Registry (GHCR). The build job depends on the test job via
+# `needs:`, so the image is only built/pushed when CI is green.
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]                                # also fires on version tags like v0.1.0
   pull_request:
     branches: [main]
   workflow_dispatch:                            # also runnable manually from the Actions tab
+
+env:
+  REGISTRY: ghcr.io                             # GitHub's built-in container registry
+  IMAGE_NAME: ${{ github.repository }}          # expands to <owner>/<repo>
 
 jobs:
   lint-format-test:
@@ -44,3 +50,42 @@ jobs:
 
       - name: Run tests
         run: pytest -q --tb=short
+
+  build-and-push:
+    needs: [lint-format-test]                   # waits for CI; if any matrix variant fails, this job is skipped
+    if: github.event_name != 'pull_request'     # build/push only on main pushes, v* tags, and manual runs — not on PRs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write                           # required to push to ghcr.io — minimal-privilege scope
+    steps:
+      - uses: actions/checkout@v4               # clone the repo (same first step as the test job)
+
+      - uses: docker/setup-buildx-action@v3     # enables BuildKit features: layer caching, multi-platform, etc.
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3            # authenticates `docker push` against the registry
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }} # auto-issued by GitHub for every workflow run — no manual secret setup
+
+      - id: meta                                # this step has an id so a later step can read its outputs
+        name: Compute image tags
+        uses: docker/metadata-action@v5         # generates a list of tags from the event (sha, semver, latest)
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short               # always — e.g. sha-a1b2c3d (immutable, safest in production)
+            type=ref,event=tag                  # only on v* tags — e.g. v0.1.0
+            type=raw,value=latest,enable={{is_default_branch}}   # only on main pushes — floating "latest"
+
+      - name: Build & push image
+        uses: docker/build-push-action@v5       # the actual `docker build` + `docker push` step
+        with:
+          context: .                            # Dockerfile location relative to repo root
+          push: true                            # if false, this would build but skip the push
+          tags: ${{ steps.meta.outputs.tags }}  # consumes the list computed by the meta step above
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha                  # pulls cached layers from the GitHub Actions cache
+          cache-to: type=gha,mode=max           # stores all layers (mode=max) so the next run hits the cache
